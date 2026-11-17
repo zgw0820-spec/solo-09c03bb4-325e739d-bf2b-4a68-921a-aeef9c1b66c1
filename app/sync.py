@@ -18,8 +18,11 @@ import logging
 from typing import Any, Dict, Optional
 
 import httpx
+from pydantic import ValidationError
 
 from .config import settings
+from .failover import registry
+from .models import normalise_zone_records
 from .storage import storage
 
 log = logging.getLogger("sync")
@@ -70,22 +73,22 @@ async def sync_once(client: Optional[httpx.AsyncClient] = None) -> SyncOutcome:
                         local_serial, err)
             return SyncOutcome("failed", False, local_serial, None, err)
 
-        upstream_serial = int(payload.get("serial", -1))
-        records = payload.get("records")
+        try:
+            upstream_serial = int(payload.get("serial", -1))
+        except (TypeError, ValueError):
+            upstream_serial = -1
+        raw_records = payload.get("records")
         published_at = payload.get("published_at")
-        if (
-            upstream_serial < 1
-            or not isinstance(records, list)
-            or not isinstance(published_at, str)
-            or any(
-                not isinstance(r, dict)
-                or not isinstance(r.get("name"), str)
-                or not isinstance(r.get("ip"), str)
-                for r in records
-            )
-        ):
-            err = "malformed zone payload from primary"
+        try:
+            # Full re-validation: a malformed or policy-violating payload
+            # is a failed transfer and must not touch the active version.
+            records = normalise_zone_records(raw_records)
+            if upstream_serial < 1 or not isinstance(published_at, str):
+                raise ValueError("invalid serial or published_at")
+        except (ValidationError, ValueError, TypeError) as exc:
+            err = f"malformed zone payload from primary: {exc}"
             storage.update_sync_state("failed", err, upstream_serial)
+            log.warning("rejected sync payload: %s", err)
             return SyncOutcome(
                 "failed", False, local_serial, upstream_serial, err
             )
@@ -104,13 +107,18 @@ async def sync_once(client: Optional[httpx.AsyncClient] = None) -> SyncOutcome:
             )
 
         # Apply the complete new version in one atomic transaction.
+        # Probe state for the old serial is discarded by the prober as
+        # soon as it observes the new active version.
         applied = storage.commit_version(
-            upstream_serial,
-            [{"name": r["name"], "ip": r["ip"]} for r in records],
-            published_at,
+            upstream_serial, records, published_at
         )
         if applied:
             storage.update_sync_state("synced", None, upstream_serial)
+            # Immediately move probe state to the new version; the probe
+            # loop would also do this on its next tick. This guarantees a
+            # late packet from a pre-sync probe can never answer with the
+            # new version's records.
+            registry.observe(upstream_serial, records)
             log.info("applied serial=%s from primary", upstream_serial)
             return SyncOutcome(
                 "synced", True, upstream_serial, upstream_serial

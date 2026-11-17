@@ -21,6 +21,13 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     role: str = _env("DNS_ROLE", "primary")
@@ -37,6 +44,11 @@ class Settings:
     sync_interval: float = float(_env_int("SYNC_INTERVAL", 5))
     http_timeout: float = float(_env_int("HTTP_TIMEOUT", 10))
     max_records: int = _env_int("MAX_RECORDS", 8)
+    # Managed A records: background TCP probes and answer TTL.
+    probe_interval: float = _env_float("PROBE_INTERVAL", 1.0)
+    probe_timeout: float = _env_float("PROBE_TIMEOUT", 0.5)
+    probe_workers: int = _env_int("PROBE_WORKERS", 32)
+    dns_ttl: int = _env_int("DNS_TTL", 30)
 
     @property
     def is_primary(self) -> bool:

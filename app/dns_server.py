@@ -4,6 +4,12 @@ Every answer is built from one immutable version snapshot fetched in a
 single storage read, so a reply can never mix records of two versions.
 While a transfer is in progress the old version stays active and keeps
 being answered.
+
+Managed A records are answered from the in-memory failover registry,
+always queried with the *same serial* as the snapshot that produced the
+record. The DNS path never probes and never waits on the prober: the
+registry lookup is a short in-memory lock that is never held during a
+connect, so a slow probe cannot delay a reply.
 """
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ from dnslib import A, DNSRecord, RR, QTYPE, RCODE
 from dnslib.server import BaseResolver, DNSServer
 
 from .config import settings
+from .failover import registry, prober
 from .storage import storage
 
 log = logging.getLogger("dns")
@@ -41,17 +48,36 @@ class ZoneResolver(BaseResolver):
             reply.header.rcode = RCODE.NOERROR
             return reply
 
-        # One consistent snapshot -> one version per answer.
+        # One consistent snapshot -> snapshot serial + records are used
+        # together for the whole answer.
         serial, records, _ = storage.get_active_version()
         name_map = {}
         for rec in records:
-            name_map.setdefault(rec["name"], []).append(rec["ip"])
+            name_map.setdefault(rec["name"], []).append(rec)
 
-        ips: List[str] = name_map.get(qname, [])
-        if not ips:
+        matched = name_map.get(qname)
+        if not matched:
             reply.header.rcode = RCODE.NXDOMAIN
             log.debug("NXDOMAIN %s (serial=%s)", qname, serial)
             return reply
+
+        rec = matched[0]
+        if rec.get("ip") is not None:
+            ips = [rec["ip"]]
+        else:
+            # Managed record: probe state is always looked up under the
+            # same serial as the snapshot above. A decision is None when
+            # no valid result exists for this version or both addresses
+            # are down -> SERVFAIL. Never fall back to another version.
+            decision = registry.decide(serial, qname)
+            if decision.answer is None:
+                reply.header.rcode = RCODE.SERVFAIL
+                log.debug(
+                    "SERVFAIL %s (serial=%s active=%s)",
+                    qname, serial, decision.active,
+                )
+                return reply
+            ips = [decision.answer]
 
         for ip in ips:
             reply.add_answer(
@@ -59,7 +85,7 @@ class ZoneResolver(BaseResolver):
                     q.qname,
                     QTYPE.A,
                     rdata=A(ip),
-                    ttl=30,
+                    ttl=settings.dns_ttl,
                 )
             )
         log.debug("ANSWER %s -> %s (serial=%s)", qname, ips, serial)
@@ -71,6 +97,10 @@ class DnsService:
         self._server: DNSServer | None = None
 
     def start(self) -> None:
+        # Probes must run on every DNS server, primary and backup alike,
+        # and independently from HTTP sync. The thread only reads the
+        # active version and performs bounded TCP connects.
+        prober.start()
         resolver = ZoneResolver()
         # DNSServer is itself a daemon thread; start_thread() runs the
         # UDP serve loop without blocking the FastAPI startup.
@@ -90,6 +120,7 @@ class DnsService:
         )
 
     def stop(self) -> None:
+        prober.stop()
         if self._server is not None:
             try:
                 self._server.stop()
